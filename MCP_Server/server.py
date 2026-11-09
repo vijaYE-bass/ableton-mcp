@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Union
+from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
 from .telemetry import record_startup
 from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
@@ -130,8 +130,9 @@ class AbletonConnection:
         
         # Check if this is a state-modifying command
         is_modifying_command = command_type in [
-            "create_midi_track", "create_audio_track", "set_track_name",
-            "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
+            "create_midi_track", "create_audio_track", "create_scene", "set_track_name",
+            "create_clip", "create_audio_clip", "create_audio_clips_batch",
+            "add_notes_to_clip", "set_clip_name",
             "delete_clip",
             "clear_notes_from_clip",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
@@ -147,16 +148,21 @@ class AbletonConnection:
         # large audio file). Give them a wider socket timeout so we don't time
         # out before the Remote Script's own queue does.
         long_running_commands = {"create_audio_clip": 65.0}
-        
+
         try:
             logger.info(f"Sending command: {command_type} with params: {params}")
-            
+
             # Send the command
             self.sock.sendall(json.dumps(command).encode('utf-8'))
             logger.info(f"Command sent, waiting for response...")
-            
-            # Set timeout based on command type
-            if command_type in long_running_commands:
+
+            # Set timeout based on command type. create_audio_clips_batch runs
+            # each import sequentially on Live's main thread, so its budget
+            # scales with the number of clips rather than being a fixed value.
+            if command_type == "create_audio_clips_batch":
+                clip_count = len(params.get("clips") or [])
+                timeout = max(65.0, 65.0 * clip_count)
+            elif command_type in long_running_commands:
                 timeout = long_running_commands[command_type]
             else:
                 timeout = 15.0 if is_modifying_command else 10.0
@@ -667,6 +673,36 @@ def create_audio_track(ctx: Context, index: int = -1, user_prompt: str = "") -> 
 
 
 @mcp.tool()
+@telemetry_tool("create_scene")
+@trajectory_tool("create_scene")
+def create_scene(ctx: Context, index: int = -1, user_prompt: str = "") -> str:
+    """
+    Create a new scene in the Ableton session.
+
+    A scene is a row of clip slots spanning every track, not just one —
+    adding a scene grows every track's clip-slot count by one, which is the
+    only way to make room for more clips on a track whose slots are full.
+
+    Parameters:
+    - index: The index to insert the scene at (-1 = end of list)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("create_scene")
+        if missing:
+            return missing
+
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_scene", {"index": index})
+        return f"Created new scene '{result.get('name', 'unknown')}' at index {result.get('index', '?')}"
+    except Exception as e:
+        logger.error(f"Error creating scene: {str(e)}")
+        return f"Error creating scene: {str(e)}"
+
+
+@mcp.tool()
 @rich_telemetry_tool("set_track_name")
 @trajectory_tool("set_track_name")
 def set_track_name(ctx: Context, track_index: int, name: str, user_prompt: str = "") -> str:
@@ -714,7 +750,15 @@ def create_clip(ctx: Context, track_index: int, clip_index: int, length: float =
 @mcp.tool()
 @rich_telemetry_tool("create_audio_clip")
 @trajectory_tool("create_audio_clip")
-def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str, user_prompt: str = "") -> str:
+def create_audio_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    path: str,
+    warp: Optional[bool] = None,
+    warp_mode: Optional[int] = None,
+    user_prompt: str = "",
+) -> str:
     """
     Create a new audio clip in an audio track's clip slot by importing a file.
 
@@ -727,19 +771,125 @@ def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str
     - clip_index: The index of the clip slot to create the clip in
     - path: Absolute path to a supported audio file (e.g. a .wav). The target
       track must be an audio track and the clip slot must be empty.
+    - warp: If set, explicitly turns warping on (True) or off (False) on the
+      imported clip, overriding Live's "Auto-Warp Long Samples" preference.
+      Leave unset to keep whatever Live decides on import.
+    - warp_mode: If set, the warp algorithm: 0=Beats, 1=Tones, 2=Texture,
+      3=Re-Pitch, 4=Complex, 5=REX (only valid for .rex files), 6=Complex Pro.
+      Has no audible effect unless the clip ends up warped.
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        ableton = get_ableton_connection()
-        result = ableton.send_command("create_audio_clip", {
+        if warp_mode is not None and warp_mode not in range(7):
+            return f"Error creating audio clip: warp_mode must be 0-6, got {warp_mode}"
+
+        command_params = {
             "track_index": track_index,
             "clip_index": clip_index,
-            "path": path
-        })
-        return f"Created audio clip '{result.get('name', 'clip')}' at track {track_index}, slot {clip_index} (length {result.get('length', '?')} beats)"
+            "path": path,
+        }
+        if warp is not None or warp_mode is not None:
+            from .script_handshake import require_capability
+
+            missing = require_capability("create_audio_clip_warp")
+            if missing:
+                return missing
+            if warp is not None:
+                command_params["warp"] = warp
+            if warp_mode is not None:
+                command_params["warp_mode"] = warp_mode
+
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_audio_clip", command_params)
+        return (
+            f"Created audio clip '{result.get('name', 'clip')}' at track {track_index}, "
+            f"slot {clip_index} (length {result.get('length', '?')} beats, "
+            f"warping={result.get('warping', '?')}, warp_mode={result.get('warp_mode', '?')})"
+        )
     except Exception as e:
         logger.error(f"Error creating audio clip: {str(e)}")
         return f"Error creating audio clip: {str(e)}"
+
+# A batch import runs sequentially on Live's main thread with the client
+# socket locked for the duration (see long_running_commands scaling in
+# AbletonConnection._send_command_locked) — bounding the size keeps one
+# runaway request from locking out every other tool call for several minutes.
+MAX_BATCH_CLIPS = 32
+
+@mcp.tool()
+@rich_telemetry_tool("create_audio_clips_batch")
+@trajectory_tool("create_audio_clips_batch")
+def create_audio_clips_batch(ctx: Context, clips: List[Dict[str, Any]], user_prompt: str = "") -> str:
+    """
+    Import multiple audio files into clip slots in one call.
+
+    Requires Ableton Live 12.0.5 or newer (same Live API dependency as
+    create_audio_clip). Each file is imported sequentially on Live's main
+    thread, so a large batch can take a while — budget roughly up to a
+    minute per clip. A failure on one clip does not stop the rest of the
+    batch; check each entry's "status" in the result.
+
+    Parameters:
+    - clips: A list of dicts (capped at MAX_BATCH_CLIPS, currently 32), each
+      describing one import:
+        - track_index (int, required): audio track to import into
+        - clip_index (int, required): clip slot to import into
+        - path (str, required): absolute path to the audio file
+        - warp (bool, optional): explicitly turn warping on/off
+        - warp_mode (int, optional): 0=Beats, 1=Tones, 2=Texture, 3=Re-Pitch,
+          4=Complex, 5=REX, 6=Complex Pro
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        if not clips:
+            return "Error creating audio clips: 'clips' list is empty"
+        if len(clips) > MAX_BATCH_CLIPS:
+            return (
+                f"Error creating audio clips: batch of {len(clips)} exceeds the "
+                f"{MAX_BATCH_CLIPS}-clip limit per call; split into smaller batches"
+            )
+        for i, clip in enumerate(clips):
+            if "track_index" not in clip or "clip_index" not in clip or not clip.get("path"):
+                return (
+                    f"Error creating audio clips: clip at index {i} is missing a "
+                    f"required field (track_index, clip_index, path)"
+                )
+            warp_mode = clip.get("warp_mode")
+            if warp_mode is not None and warp_mode not in range(7):
+                return (
+                    f"Error creating audio clips: clip at index {i} has invalid "
+                    f"warp_mode {warp_mode} (must be 0-6)"
+                )
+
+        from .script_handshake import require_capability
+
+        missing = require_capability("create_audio_clips_batch")
+        if missing:
+            return missing
+        if any(c.get("warp") is not None or c.get("warp_mode") is not None for c in clips):
+            missing = require_capability("create_audio_clip_warp")
+            if missing:
+                return missing
+
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_audio_clips_batch", {"clips": clips})
+        results = result.get("results", [])
+        succeeded = sum(1 for r in results if r.get("status") == "success")
+        failed = len(results) - succeeded
+        lines = [f"Imported {succeeded}/{len(results)} clips ({failed} failed):"]
+        for r in results:
+            location = f"track {r.get('track_index')}, slot {r.get('clip_index')}"
+            if r.get("status") == "success":
+                lines.append(
+                    f"  [{r.get('index')}] {location}: '{r.get('name', 'clip')}' "
+                    f"({r.get('length', '?')} beats, warping={r.get('warping', '?')})"
+                )
+            else:
+                lines.append(f"  [{r.get('index')}] {location}: FAILED - {r.get('message', 'unknown error')}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Error creating audio clips batch: {str(e)}")
+        return f"Error creating audio clips batch: {str(e)}"
 
 @mcp.tool()
 @rich_telemetry_tool("add_notes_to_clip", capture_notes=True)

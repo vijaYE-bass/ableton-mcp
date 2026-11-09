@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.9.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -48,8 +48,11 @@ SCRIPT_CAPABILITIES = [
     "drain_passive_events",
     "create_midi_track",
     "create_audio_track",
+    "create_scene",
     "create_clip",
     "create_audio_clip",
+    "create_audio_clip_warp",
+    "create_audio_clips_batch",
     "add_notes_to_clip",
     "load_instrument_or_effect",
     "get_arrangement_clips",
@@ -288,8 +291,9 @@ class AbletonMCP(ControlSurface):
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
             # Commands that modify Live's state should be scheduled on the main thread
-            elif command_type in ["create_midi_track", "create_audio_track", "set_track_name",
-                                 "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
+            elif command_type in ["create_midi_track", "create_audio_track", "create_scene", "set_track_name",
+                                 "create_clip", "create_audio_clip", "create_audio_clips_batch",
+                                 "add_notes_to_clip", "set_clip_name",
                                  "set_arrangement_clip_name",
                                  "delete_clip",
                                  "clear_notes_from_clip",
@@ -314,6 +318,9 @@ class AbletonMCP(ControlSurface):
                         elif command_type == "create_audio_track":
                             index = params.get("index", -1)
                             result = self._create_audio_track(index)
+                        elif command_type == "create_scene":
+                            index = params.get("index", -1)
+                            result = self._create_scene(index)
                         elif command_type == "set_track_name":
                             track_index = params.get("track_index", 0)
                             name = params.get("name", "")
@@ -327,7 +334,13 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             clip_index = params.get("clip_index", 0)
                             path = params.get("path", "")
-                            result = self._create_audio_clip(track_index, clip_index, path)
+                            warp = params.get("warp")
+                            warp_mode = params.get("warp_mode")
+                            result = self._create_audio_clip(
+                                track_index, clip_index, path, warp=warp, warp_mode=warp_mode)
+                        elif command_type == "create_audio_clips_batch":
+                            clips = params.get("clips", [])
+                            result = self._create_audio_clips_batch(clips)
                         elif command_type == "add_notes_to_clip":
                             track_index = params.get("track_index", 0)
                             clip_index = params.get("clip_index", 0)
@@ -417,8 +430,13 @@ class AbletonMCP(ControlSurface):
                 
                 # create_audio_clip decodes/imports the file on the main
                 # thread and needs more than the default headroom.
+                # create_audio_clips_batch imports each clip in turn, so its
+                # budget scales with how many clips were asked for.
                 long_running_commands = {"create_audio_clip": 60.0}
-                queue_timeout = long_running_commands.get(command_type, 10.0)
+                if command_type == "create_audio_clips_batch":
+                    queue_timeout = max(60.0, 60.0 * len(params.get("clips") or []))
+                else:
+                    queue_timeout = long_running_commands.get(command_type, 10.0)
                 try:
                     task_response = response_queue.get(timeout=queue_timeout)
                     if task_response.get("status") == "error":
@@ -675,6 +693,23 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error creating audio track: " + str(e))
             raise
 
+    def _create_scene(self, index):
+        """Create a new scene at the specified index"""
+        try:
+            self._song.create_scene(index)
+
+            new_scene_index = len(self._song.scenes) - 1 if index == -1 else index
+            new_scene = self._song.scenes[new_scene_index]
+
+            result = {
+                "index": new_scene_index,
+                "name": new_scene.name
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error creating scene: " + str(e))
+            raise
+
 
     def _set_track_name(self, track_index, name):
         """Set the name of a track"""
@@ -723,12 +758,17 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error creating clip: " + str(e))
             raise
 
-    def _create_audio_clip(self, track_index, clip_index, path):
+    def _create_audio_clip(self, track_index, clip_index, path, warp=None, warp_mode=None):
         """Create an audio clip in the specified audio track clip slot by importing a file.
 
         Requires Ableton Live 12.0.5 or newer (the underlying
         ClipSlot.create_audio_clip Live API was introduced in 12.0.5 — it is
         not available in earlier 12.0.x releases).
+
+        warp/warp_mode are optional overrides applied after import: warp
+        turns Clip.warping on/off, warp_mode sets Clip.warp_mode (0=Beats,
+        1=Tones, 2=Texture, 3=Re-Pitch, 4=Complex, 5=REX, 6=Complex Pro).
+        Left as None, Live's own "Auto-Warp Long Samples" preference decides.
         """
         try:
             if not path:
@@ -736,6 +776,9 @@ class AbletonMCP(ControlSurface):
 
             if not os.path.isabs(path):
                 raise ValueError("Audio file path must be absolute (got: %s)" % path)
+
+            if warp_mode is not None and warp_mode not in range(7):
+                raise ValueError("warp_mode must be 0-6 (got: %r)" % (warp_mode,))
 
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
@@ -760,16 +803,52 @@ class AbletonMCP(ControlSurface):
                 )
 
             clip_slot.create_audio_clip(path)
+            clip = clip_slot.clip
+
+            if warp is not None:
+                clip.warping = bool(warp)
+            if warp_mode is not None:
+                clip.warp_mode = warp_mode
 
             result = {
-                "name": clip_slot.clip.name,
-                "length": clip_slot.clip.length,
-                "is_audio_clip": clip_slot.clip.is_audio_clip
+                "name": clip.name,
+                "length": clip.length,
+                "is_audio_clip": clip.is_audio_clip,
+                "warping": bool(getattr(clip, "warping", False)),
+                "warp_mode": getattr(clip, "warp_mode", None),
             }
             return result
         except Exception as e:
             self.log_message("Error creating audio clip: " + str(e))
             raise
+
+    def _create_audio_clips_batch(self, clips):
+        """Import multiple audio files into clip slots in one call.
+
+        Each entry is attempted independently via _create_audio_clip; a
+        failure on one clip is recorded in its own result entry and does not
+        stop the rest of the batch.
+        """
+        results = []
+        for i, spec in enumerate(clips or []):
+            track_index = spec.get("track_index")
+            clip_index = spec.get("clip_index")
+            entry = {"index": i, "track_index": track_index, "clip_index": clip_index}
+            try:
+                clip_result = self._create_audio_clip(
+                    track_index,
+                    clip_index,
+                    spec.get("path", ""),
+                    warp=spec.get("warp"),
+                    warp_mode=spec.get("warp_mode"),
+                )
+                entry["status"] = "success"
+                entry.update(clip_result)
+            except Exception as e:
+                entry["status"] = "error"
+                entry["message"] = str(e)
+            results.append(entry)
+        return {"results": results}
 
     def _add_notes_to_clip(self, track_index, clip_index, notes):
         """Add MIDI notes to a clip"""

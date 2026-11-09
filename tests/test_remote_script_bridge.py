@@ -234,3 +234,146 @@ def test_browser_tree_caps_a_huge_folder_and_flags_it(script_module):
 
     assert len(category["children"]) == 64
     assert category["has_more"] is True
+
+
+# --------------------------------------------------------- audio clip import
+
+def test_new_capabilities_are_advertised(script_module):
+    assert "create_audio_clip_warp" in script_module.SCRIPT_CAPABILITIES
+    assert "create_audio_clips_batch" in script_module.SCRIPT_CAPABILITIES
+    assert "create_scene" in script_module.SCRIPT_CAPABILITIES
+
+
+class FakeClip(object):
+    def __init__(self, name="Clip", length=4.0, warping=True, warp_mode=4):
+        self.name = name
+        self.length = length
+        self.is_audio_clip = True
+        self.warping = warping
+        self.warp_mode = warp_mode
+
+
+class FakeClipSlot(object):
+    def __init__(self, has_clip=False, fail_with=None):
+        self.has_clip = has_clip
+        self._fail_with = fail_with
+        self.clip = None
+        self.created_path = None
+
+    def create_audio_clip(self, path):
+        if self._fail_with is not None:
+            raise self._fail_with
+        self.created_path = path
+        self.clip = FakeClip()
+        self.has_clip = True
+
+
+class FakeTrack(object):
+    def __init__(self, clip_slots, has_audio_input=True, has_midi_input=False):
+        self.clip_slots = clip_slots
+        self.has_audio_input = has_audio_input
+        self.has_midi_input = has_midi_input
+
+
+class FakeScene(object):
+    def __init__(self, name="Scene"):
+        self.name = name
+
+
+class FakeSong(object):
+    def __init__(self, tracks, scenes=None):
+        self.tracks = tracks
+        self.scenes = list(scenes) if scenes is not None else []
+
+    def create_scene(self, index):
+        new_scene = FakeScene()
+        if index == -1:
+            self.scenes.append(new_scene)
+        else:
+            self.scenes.insert(index, new_scene)
+
+
+def make_audio_instance(script_module, tracks, scenes=None):
+    inst = make_instance(script_module)
+    inst._song = FakeSong(tracks, scenes=scenes)
+    return inst
+
+
+def test_create_audio_clip_applies_warp_overrides(script_module):
+    slot = FakeClipSlot()
+    inst = make_audio_instance(script_module, [FakeTrack([slot])])
+
+    result = inst._create_audio_clip(0, 0, "/abs/path.wav", warp=False, warp_mode=2)
+
+    assert slot.created_path == "/abs/path.wav"
+    assert slot.clip.warping is False
+    assert slot.clip.warp_mode == 2
+    assert result["warping"] is False
+    assert result["warp_mode"] == 2
+
+
+def test_create_audio_clip_leaves_warp_alone_when_unset(script_module):
+    """warp/warp_mode default to None: Live's own import decision is untouched."""
+    slot = FakeClipSlot()
+    inst = make_audio_instance(script_module, [FakeTrack([slot])])
+
+    inst._create_audio_clip(0, 0, "/abs/path.wav")
+
+    assert slot.clip.warping is True  # FakeClip's default, never overwritten
+    assert slot.clip.warp_mode == 4
+
+
+def test_create_audio_clip_rejects_out_of_range_warp_mode(script_module):
+    slot = FakeClipSlot()
+    inst = make_audio_instance(script_module, [FakeTrack([slot])])
+
+    with pytest.raises(ValueError):
+        inst._create_audio_clip(0, 0, "/abs/path.wav", warp_mode=9)
+
+    assert slot.created_path is None  # rejected before the import was attempted
+
+
+def test_create_audio_clips_batch_one_failure_does_not_stop_the_rest(script_module):
+    good_slot = FakeClipSlot()
+    bad_slot = FakeClipSlot(has_clip=True)  # occupied -> _create_audio_clip raises
+    inst = make_audio_instance(script_module, [FakeTrack([bad_slot, good_slot])])
+
+    out = inst._create_audio_clips_batch([
+        {"track_index": 0, "clip_index": 0, "path": "/abs/bad.wav"},
+        {"track_index": 0, "clip_index": 1, "path": "/abs/good.wav", "warp_mode": 0},
+    ])
+
+    results = out["results"]
+    assert [r["status"] for r in results] == ["error", "success"]
+    assert results[0]["index"] == 0
+    assert "already has a clip" in results[0]["message"]
+    assert results[1]["index"] == 1
+    assert good_slot.created_path == "/abs/good.wav"
+    assert results[1]["warp_mode"] == 0
+
+
+def test_create_audio_clips_batch_empty_list_returns_empty_results(script_module):
+    inst = make_audio_instance(script_module, [])
+    assert inst._create_audio_clips_batch([]) == {"results": []}
+
+
+# ------------------------------------------------------------------- scenes
+
+def test_create_scene_appends_at_end(script_module):
+    inst = make_audio_instance(script_module, [], scenes=[FakeScene(), FakeScene()])
+
+    result = inst._create_scene(-1)
+
+    assert len(inst._song.scenes) == 3
+    assert result["index"] == 2
+    assert result["name"] == inst._song.scenes[2].name
+
+
+def test_create_scene_inserts_at_explicit_index(script_module):
+    inst = make_audio_instance(script_module, [], scenes=[FakeScene(), FakeScene()])
+
+    result = inst._create_scene(1)
+
+    assert len(inst._song.scenes) == 3
+    assert result["index"] == 1
+    assert result["name"] == inst._song.scenes[1].name
